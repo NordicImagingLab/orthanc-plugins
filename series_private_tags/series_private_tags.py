@@ -48,22 +48,15 @@ class SeriesMainPrivateDicomTagsHandler:
 
     def on_stored_instance(self, simple_tags: dict, instance_db_object: dict):
         """
-        Extract private tags from the instance and store them in the series metadata.
+        Extract and merge private tags from the instance and store them in the series metadata.
 
         This will be run in a background thread, so be careful with any shared state.
+
+        Private tags may be on only some instances of a series, and instances are not stored in any particular order.
+
+        A tag that is already stored will keep the first value and not be overwritten.
         """
         try:
-            # Get the series ID from the instance
-            series_id = instance_db_object["ParentSeries"]
-
-            # Check if we've already processed this series
-            try:
-                orthanc.RestApiGet(f"/series/{series_id}/metadata/{METADATA_KEY}")
-                # If we reach here, metadata exists, so we've already processed this series
-                return
-            except Exception:
-                pass
-
             found_private_tags = {}
             for tag in self.privateTags:
                 if tag in simple_tags:
@@ -72,13 +65,38 @@ class SeriesMainPrivateDicomTagsHandler:
                     else:  # Full value tag
                         found_private_tags[tag] = simple_tags[tag]  # Store full value
 
-            if found_private_tags:
-                # Store all private tags as a single JSON metadata entry
-                metadata_value = json.dumps(found_private_tags)
-                orthanc.RestApiPut(
-                    f"/series/{series_id}/metadata/{METADATA_KEY}",
-                    metadata_value.encode(),
-                )
+            if not found_private_tags:
+                return
+
+            # Get the series ID from the instance
+            series_id = instance_db_object["ParentSeries"]
+
+            # Start empty only when the series has no metadata stored yet. Any other failure to read or
+            # decode it goes to the handler below without writing, so stored tags are never replaced.
+            series_metadata = json.loads(
+                orthanc.RestApiGet(f"/series/{series_id}/metadata?expand")
+            )
+            if METADATA_KEY in series_metadata:
+                stored_tags = json.loads(series_metadata[METADATA_KEY])
+            else:
+                stored_tags = {}
+
+            # Extract the tags not previously stored for this series, so we only update with new information
+            new_tags = {
+                tag: value
+                for tag, value in found_private_tags.items()
+                if tag not in stored_tags
+            }
+            if not new_tags:
+                return
+
+            stored_tags.update(new_tags)
+            # Store all private tags as a single JSON metadata entry
+            metadata_value = json.dumps(stored_tags)
+            orthanc.RestApiPut(
+                f"/series/{series_id}/metadata/{METADATA_KEY}",
+                metadata_value.encode(),
+            )
 
         except Exception as e:
             orthanc.LogError(f"Error processing private tags: {str(e)}")
